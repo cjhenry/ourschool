@@ -251,7 +251,7 @@ async def login_for_access_token(
     return create_login_session(db, user)
 
 
-def create_login_session(db: Session, user: User):
+def create_login_session(db: Session, user: User, authentication_event: str = "login"):
     """Create the same browser session for every authentication method."""
     # Opportunistic cleanup keeps expired session secrets out of the database.
     db.query(BrowserSession).filter(
@@ -272,7 +272,7 @@ def create_login_session(db: Session, user: User):
     result = issue_session_token(db, session, user)
 
     log_authentication_event(
-        "login", user_id=str(user.id), username=user.username, success=True
+        authentication_event, user_id=str(user.id), username=user.username, success=True
     )
 
     return result

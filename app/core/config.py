@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     oidc_user_match_claim: str = "email"
     oidc_allow_unverified_email: bool = False
     oidc_auto_provision: bool = False
-    oidc_default_role: str = "student"
+    oidc_allow_admin_linking: bool = False
     oidc_disable_local_login: bool = False
 
     # Request hardening

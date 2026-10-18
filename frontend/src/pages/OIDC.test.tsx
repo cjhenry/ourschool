@@ -17,7 +17,7 @@
  */
 
 import { StrictMode } from 'react'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Login from './Login'
@@ -45,7 +45,7 @@ describe('OIDC login', () => {
       enabled: false, button_label: 'SSO', local_login_enabled: true,
     }) })
     renderPage(<Login />)
-    expect(screen.getByLabelText('Username')).toBeInTheDocument()
+    expect(await screen.findByLabelText('Username')).toBeInTheDocument()
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: 'SSO' })).not.toBeInTheDocument()
   })
@@ -56,6 +56,31 @@ describe('OIDC login', () => {
     renderPage(<Login />)
     expect(await screen.findByRole('button', { name: 'School SSO' })).toBeInTheDocument()
     expect(screen.queryByLabelText('Username')).not.toBeInTheDocument()
+  })
+  it('shows both login options and navigates to the provider', async () => {
+    const assign = vi.fn()
+    vi.stubGlobal('location', { ...window.location, assign })
+    fetchMock.mockImplementation(async (url: string) => ({ ok: true, json: async () =>
+      url.endsWith('/start') ? { authorization_url: 'https://id.example/authorize' } :
+        { enabled: true, button_label: 'SSO', local_login_enabled: true } }))
+    renderPage(<Login />)
+    fireEvent.click(await screen.findByRole('button', { name: 'SSO' }))
+    expect(screen.getByLabelText('Username')).toBeInTheDocument()
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('https://id.example/authorize'))
+  })
+  it('shows start errors above both login options', async () => {
+    fetchMock.mockImplementation(async (url: string) => ({ ok: !url.endsWith('/start'), json: async () =>
+      ({ enabled: true, button_label: 'SSO', local_login_enabled: true }) }))
+    renderPage(<Login />)
+    fireEvent.click(await screen.findByRole('button', { name: 'SSO' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Single sign-on is currently unavailable')
+    expect(screen.getByLabelText('Username')).toBeInTheDocument()
+  })
+  it('waits for config and falls back to passwords on failure', async () => {
+    fetchMock.mockRejectedValue(new Error('offline'))
+    renderPage(<Login />)
+    expect(screen.queryByLabelText('Username')).not.toBeInTheDocument()
+    expect(await screen.findByLabelText('Username')).toBeInTheDocument()
   })
   it('exchanges the code once under StrictMode and installs the existing session', async () => {
     window.history.replaceState(null, '', '/auth/oidc/callback?code=code&state=state')

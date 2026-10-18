@@ -30,11 +30,13 @@ const Login: React.FC = () => {
   const [error, setError] = useState('')
 
   const [oidc, setOidc] = useState({ enabled: false, button_label: '', local_login_enabled: true })
+  const [configLoaded, setConfigLoaded] = useState(false)
   useEffect(() => {
     fetch(`${config.api.baseUrl}/auth/oidc/config`)
       .then(response => response.ok ? response.json() : null)
       .then(data => { if (data) setOidc(data) })
       .catch(() => {})
+      .finally(() => setConfigLoaded(true))
   }, [])
 
   const startSSO = async () => {
@@ -101,18 +103,12 @@ const Login: React.FC = () => {
         </div>
 
         {location.state?.message && <p role="status" className="mb-4 text-sm text-muted">{location.state.message}</p>}
+        {error && <div role="alert" className="mb-4 px-4 py-3 rounded-card text-[13px] text-neg-fg bg-neg-bg border border-neg-fg/20">{error}</div>}
         {oidc.enabled && <button type="button" disabled={isLoading} onClick={startSSO}
           className="w-full mb-4 py-2.5 px-4 rounded-field bg-btn-primary-bg text-btn-primary-fg disabled:opacity-50">
           {oidc.button_label}
         </button>}
-        {error && !oidc.local_login_enabled && <p role="alert">{error}</p>}
-        {oidc.local_login_enabled && <form onSubmit={handleSubmit} className="space-y-4">
-          {error && (
-            <div className="px-4 py-3 rounded-card text-[13px] text-neg-fg bg-neg-bg border border-neg-fg/20">
-              {error}
-            </div>
-          )}
-
+        {configLoaded && oidc.local_login_enabled && <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label htmlFor="login-username" className="block text-[11px] font-semibold text-faint uppercase tracking-[.06em] mb-1.5">
               Username

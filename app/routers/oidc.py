@@ -18,9 +18,11 @@
 
 import base64
 import hashlib
+import json
 import secrets
 import time
-from urllib.parse import urlencode, urlsplit
+from typing import Annotated, Any
+from urllib.parse import quote_plus, urlencode, urlsplit
 
 import httpx
 import jwt
@@ -36,20 +38,14 @@ from app.core.logging import get_logger, log_authentication_event
 from app.core.security import get_password_hash
 from app.models.user import User, UserRole
 from app.schemas.user import Token
-from app.routers.auth import (
-    _client_ip,
-    _check_login_rate_limit,
-    _record_login_failure,
-    _clear_login_failures,
-    create_login_session,
-)
+from app.routers.auth import create_login_session
 
 router = APIRouter()
 logger = get_logger("oidc")
 _COOKIE = "ourschool_oidc"
-_PATH = "/api/auth/oidc"
-_TTL = 600
-_cache: dict = {}
+_COOKIE_PATH = "/api/auth/oidc"
+_TRANSACTION_TTL = 600
+_provider_cache: dict = {}
 
 
 class OIDCError(ValueError):
@@ -61,18 +57,20 @@ class Callback(BaseModel):
     state: str = Field(min_length=1, max_length=1024)
 
 
-def diagnostic(exc):
+def authentication_diagnostic(exc: Exception) -> str:
+    """Return a credential-free failure category."""
     return str(exc) if isinstance(exc, OIDCError) else type(exc).__name__
 
 
-def require_config():
+def require_config() -> None:
+    """Reject disabled or incomplete OIDC configuration."""
     if not settings.oidc_enabled:
         raise HTTPException(404, "Single sign-on is disabled.")
     if (
         not settings.oidc_issuer_url
         or not settings.oidc_client_id
         or settings.oidc_user_match_claim not in {"email", "preferred_username"}
-        or settings.oidc_default_role != "student"
+        or not settings.oidc_redirect_uri
         or "openid" not in settings.oidc_scopes.split()
     ):
         raise HTTPException(
@@ -80,13 +78,8 @@ def require_config():
         )
 
 
-def redirect_uri():
-    return settings.oidc_redirect_uri or (
-        settings.cors_origins[0].rstrip("/") + "/auth/oidc/callback"
-    )
-
-
-def endpoint(url):
+def validate_endpoint(url: str) -> str:
+    """Require HTTPS, except for local development endpoints."""
     parsed = urlsplit(url)
     if parsed.scheme != "https" and not (
         parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
@@ -97,36 +90,53 @@ def endpoint(url):
     return url
 
 
-async def get_json(url, *, refresh=False):
-    endpoint(url)
-    cached = _cache.get(url)
-    if not refresh and cached and cached[0] > time.monotonic():
-        return cached[1]
-    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-        response = await client.get(url)
+async def read_provider_json(
+    client: httpx.AsyncClient, method: str, url: str, **kwargs: Any
+) -> dict[str, Any]:
+    """Read a provider object with a one MiB decompressed response limit."""
+    validate_endpoint(url)
+    async with client.stream(method, url, **kwargs) as response:
         response.raise_for_status()
-        data = response.json()
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > 1024 * 1024:
+                raise OIDCError("Provider response too large")
+    data = json.loads(body)
     if not isinstance(data, dict):
         raise OIDCError("Invalid provider response")
-    # Bound memory when administrators change provider settings repeatedly.
-    if len(_cache) >= 16:
-        _cache.clear()
-    _cache[url] = (time.monotonic() + 300, data)
     return data
 
 
-async def discovery():
+async def get_json(url: str, *, refresh: bool = False) -> dict[str, Any]:
+    """Fetch and cache discovery or signing keys."""
+    validate_endpoint(url)
+    cached = _provider_cache.get(url)
+    if not refresh and cached and cached[0] > time.monotonic():
+        return cached[1]
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+        data = await read_provider_json(client, "GET", url)
+    # Bound memory when administrators change provider settings repeatedly.
+    if len(_provider_cache) >= 16:
+        _provider_cache.clear()
+    _provider_cache[url] = (time.monotonic() + 300, data)
+    return data
+
+
+async def discovery() -> dict[str, Any]:
+    """Validate the configured provider discovery document."""
     issuer = settings.oidc_issuer_url
     data = await get_json(issuer.rstrip("/") + "/.well-known/openid-configuration")
     if data.get("issuer") != issuer:
         raise OIDCError("Discovery issuer mismatch")
     for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        endpoint(data[key])
+        validate_endpoint(data[key])
     return data
 
 
 @router.get("/config")
-def public_config(response: Response):
+def public_config(response: Response) -> dict[str, Any]:
+    """Expose login UI settings without credentials."""
     response.headers["Cache-Control"] = "no-store"
     return {
         "enabled": settings.oidc_enabled,
@@ -138,13 +148,14 @@ def public_config(response: Response):
 
 
 @router.get("/start")
-async def start(response: Response):
+async def start(response: Response) -> dict[str, str]:
+    """Start a signed, nonce-bound PKCE transaction."""
     require_config()
     try:
         provider = await discovery()
         state, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(3))
-        uri = redirect_uri()
-        endpoint(uri)
+        uri = settings.oidc_redirect_uri
+        validate_endpoint(uri)
         cookie = jwt.encode(
             {
                 "state": state,
@@ -153,7 +164,7 @@ async def start(response: Response):
                 "redirect_uri": uri,
                 "iss": "ourschool-oidc-state",
                 "aud": settings.oidc_client_id,
-                "exp": int(time.time()) + _TTL,
+                "exp": int(time.time()) + _TRANSACTION_TTL,
             },
             settings.secret_key,
             algorithm="HS256",
@@ -161,11 +172,11 @@ async def start(response: Response):
         response.set_cookie(
             _COOKIE,
             cookie,
-            max_age=_TTL,
+            max_age=_TRANSACTION_TTL,
             httponly=True,
             secure=uri.startswith("https://"),
             samesite="lax",
-            path=_PATH,
+            path=_COOKIE_PATH,
         )
         response.headers["Cache-Control"] = "no-store"
         query = urlencode(
@@ -189,12 +200,19 @@ async def start(response: Response):
             "authorization_url": provider["authorization_endpoint"] + separator + query
         }
     except Exception as exc:
-        logger.warning("OIDC start failed (%s)", diagnostic(exc))
+        logger.warning("OIDC start failed (%s)", authentication_diagnostic(exc))
         raise HTTPException(503, "Single sign-on is currently unavailable.") from None
 
 
-async def verified_claims(provider, token, nonce):
+async def verified_claims(
+    provider: dict[str, Any], token: str, nonce: str
+) -> dict[str, Any]:
+    """Verify the provider signature and required identity claims."""
+    if not isinstance(token, str) or len(token.encode()) > 16384:
+        raise OIDCError("Invalid ID token size")
     header = jwt.get_unverified_header(token)
+    if not header.get("kid"):
+        raise OIDCError("Missing signing key ID")
     algorithm = header.get("alg")
     if algorithm not in {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}:
         raise OIDCError("Unsupported signing algorithm")
@@ -237,7 +255,14 @@ async def verified_claims(provider, token, nonce):
     return claims
 
 
-def match_user(db, claims):
+def match_user(db: Session, claims: dict[str, Any]) -> User:
+    """Resolve a stable identity, or safely link/provision its account."""
+    issuer, subject = claims["iss"], claims["sub"]
+    linked = (
+        db.query(User).filter_by(oidc_issuer=issuer, oidc_subject=subject).one_or_none()
+    )
+    if linked:
+        return linked
     claim = settings.oidc_user_match_claim
     value = claims.get(claim)
     if not isinstance(value, str) or not value.strip():
@@ -250,9 +275,20 @@ def match_user(db, claims):
     if len(users) > 1:
         raise OIDCError("Ambiguous account")
     if users:
-        return users[0]
+        user = users[0]
+        if user.oidc_issuer is not None or user.oidc_subject is not None:
+            raise OIDCError("Account already linked to another identity")
+        if user.role == UserRole.ADMIN and not settings.oidc_allow_admin_linking:
+            raise OIDCError("Administrator linking disabled")
+        user.oidc_issuer, user.oidc_subject = issuer, subject
+        return user
     if not settings.oidc_auto_provision:
         raise OIDCError("Unknown account")
+    if (
+        not settings.oidc_allow_unverified_email
+        and claims.get("email_verified") is not True
+    ):
+        raise OIDCError("Unverified provisioning email")
     email = claims.get("email")
     username = claims.get("preferred_username") or (
         email.split("@")[0] if isinstance(email, str) else None
@@ -270,11 +306,20 @@ def match_user(db, claims):
         .first()
     ):
         raise OIDCError("Account collision")
+    first_name = claims.get("given_name") or username
+    last_name = claims.get("family_name") or ""
+    if any(
+        not isinstance(v, str) or len(v) > 255
+        for v in (email, username, first_name, last_name)
+    ):
+        raise OIDCError("Invalid provisioning claim length")
     user = User(
+        oidc_issuer=issuer,
+        oidc_subject=subject,
         email=email,
         username=username,
-        first_name=str(claims.get("given_name") or username),
-        last_name=str(claims.get("family_name") or ""),
+        first_name=first_name,
+        last_name=last_name,
         hashed_password=get_password_hash(secrets.token_urlsafe(48)),
         role=UserRole.STUDENT,
         is_active=True,
@@ -286,10 +331,11 @@ def match_user(db, claims):
 
 
 @router.post("/callback", response_model=Token)
-async def callback(data: Callback, request: Request, db: Session = Depends(get_db)):
+async def callback(
+    data: Callback, request: Request, db: Annotated[Session, Depends(get_db)]
+) -> JSONResponse:
+    """Validate the transaction before exchanging the authorization code."""
     require_config()
-    ip = _client_ip(request)
-    _check_login_rate_limit(ip, "oidc")
     try:
         transaction = jwt.decode(
             request.cookies.get(_COOKIE, ""),
@@ -317,8 +363,6 @@ async def callback(data: Callback, request: Request, db: Session = Depends(get_d
             if "client_secret_post" in methods:
                 payload["client_secret"] = settings.oidc_client_secret
             elif "client_secret_basic" in methods:
-                from urllib.parse import quote_plus
-
                 auth = httpx.BasicAuth(
                     quote_plus(settings.oidc_client_id),
                     quote_plus(settings.oidc_client_secret),
@@ -326,11 +370,9 @@ async def callback(data: Callback, request: Request, db: Session = Depends(get_d
             else:
                 raise OIDCError("Unsupported client authentication")
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            result = await client.post(
-                provider["token_endpoint"], data=payload, auth=auth
+            tokens = await read_provider_json(
+                client, "POST", provider["token_endpoint"], data=payload, auth=auth
             )
-            result.raise_for_status()
-            tokens = result.json()
             claims = await verified_claims(
                 provider, tokens["id_token"], transaction["nonce"]
             )
@@ -339,32 +381,33 @@ async def callback(data: Callback, request: Request, db: Session = Depends(get_d
                 and "email_verified" not in claims
             )
             if missing_claim and provider.get("userinfo_endpoint"):
-                info = await client.get(
-                    endpoint(provider["userinfo_endpoint"]),
+                extra = await read_provider_json(
+                    client,
+                    "GET",
+                    provider["userinfo_endpoint"],
                     headers={"Authorization": "Bearer " + tokens["access_token"]},
                 )
-                info.raise_for_status()
-                extra = info.json()
                 if extra.get("sub") != claims["sub"]:
                     raise OIDCError("Userinfo subject mismatch")
                 claims = {**extra, **claims}
         user = match_user(db, claims)
         if not user.is_active:
             raise OIDCError("Inactive account")
-        result = create_login_session(db, user)
-        _clear_login_failures(ip, "oidc")
+        user.must_change_password = False
+        result = create_login_session(db, user, authentication_event="oidc_login")
         response = JSONResponse(Token.model_validate(result).model_dump(mode="json"))
     except Exception as exc:
         db.rollback()
-        _record_login_failure(ip, "oidc")
-        log_authentication_event("oidc_login", success=False, reason=type(exc).__name__)
-        logger.warning("OIDC callback failed (%s)", diagnostic(exc))
+        log_authentication_event(
+            "oidc_login", success=False, reason=authentication_diagnostic(exc)
+        )
+        logger.warning("OIDC callback failed (%s)", authentication_diagnostic(exc))
         response = JSONResponse(
             {
                 "detail": "Single sign-on failed. Please try again or contact your administrator."
             },
             status_code=401,
         )
-    response.delete_cookie(_COOKIE, path=_PATH)
+    response.delete_cookie(_COOKIE, path=_COOKIE_PATH)
     response.headers["Cache-Control"] = "no-store"
     return response
