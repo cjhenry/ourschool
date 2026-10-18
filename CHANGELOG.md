@@ -6,6 +6,14 @@ All notable changes to OurSchool are documented here.
 
 ## [Unreleased]
 
+### Optional OpenID Connect sign-on (#36)
+
+- Self-hosters can enable OIDC with PKCE for Pocket ID, Authentik, Keycloak,
+  Authelia and other discovery-compatible providers. Existing browser sessions
+  and password login remain unchanged by default. No database migration needed.
+- Optional student provisioning and password-login disabling are configurable;
+  see [OIDC setup](docs/oidc.md).
+
 ## [v1.1] — 2026-10-07
 
 ### PIN-protected student switching

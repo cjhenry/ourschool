@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { Eye, EyeOff, GraduationCap } from 'lucide-react'
@@ -28,6 +28,28 @@ const Login: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
+
+  const [oidc, setOidc] = useState({ enabled: false, button_label: '', local_login_enabled: true })
+  useEffect(() => {
+    fetch(`${config.api.baseUrl}/auth/oidc/config`)
+      .then(response => response.ok ? response.json() : null)
+      .then(data => { if (data) setOidc(data) })
+      .catch(() => {})
+  }, [])
+
+  const startSSO = async () => {
+    setIsLoading(true)
+    setError('')
+    try {
+      const response = await fetch(`${config.api.baseUrl}/auth/oidc/start`, { credentials: 'include' })
+      if (!response.ok) throw new Error('SSO unavailable')
+      const data = await response.json()
+      window.location.assign(data.authorization_url)
+    } catch {
+      setError('Single sign-on is currently unavailable. Please try again.')
+      setIsLoading(false)
+    }
+  }
 
   const { login } = useAuth()
   const navigate = useNavigate()
@@ -79,7 +101,12 @@ const Login: React.FC = () => {
         </div>
 
         {location.state?.message && <p role="status" className="mb-4 text-sm text-muted">{location.state.message}</p>}
-        <form onSubmit={handleSubmit} className="space-y-4">
+        {oidc.enabled && <button type="button" disabled={isLoading} onClick={startSSO}
+          className="w-full mb-4 py-2.5 px-4 rounded-field bg-btn-primary-bg text-btn-primary-fg disabled:opacity-50">
+          {oidc.button_label}
+        </button>}
+        {error && !oidc.local_login_enabled && <p role="alert">{error}</p>}
+        {oidc.local_login_enabled && <form onSubmit={handleSubmit} className="space-y-4">
           {error && (
             <div className="px-4 py-3 rounded-card text-[13px] text-neg-fg bg-neg-bg border border-neg-fg/20">
               {error}
@@ -144,7 +171,7 @@ const Login: React.FC = () => {
               'Sign in'
             )}
           </button>
-        </form>
+        </form>}
       </div>
     </div>
   )
